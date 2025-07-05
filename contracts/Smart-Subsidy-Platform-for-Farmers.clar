@@ -8,6 +8,13 @@
 (define-constant err-invalid-status (err u106))
 (define-constant err-milestone-not-ready (err u107))
 (define-constant err-oracle-not-authorized (err u108))
+(define-constant err-emergency-cooldown (err u109))
+(define-constant err-emergency-limit-exceeded (err u110))
+(define-constant err-emergency-already-claimed (err u111))
+(define-constant emergency-cooldown-blocks u1008)
+(define-constant max-emergency-percentage u30)
+
+(define-data-var emergency-fund-total uint u0)
 
 (define-data-var next-farmer-id uint u1)
 (define-data-var next-subsidy-id uint u1)
@@ -334,4 +341,103 @@
     })
     err-not-found
   )
+)
+
+(define-map emergency-requests
+  { subsidy-id: uint }
+  {
+    farmer-id: uint,
+    amount-requested: uint,
+    reason: (string-ascii 100),
+    request-block: uint,
+    oracle-verified: bool,
+    disbursed: bool,
+    verification-block: uint
+  }
+)
+
+(define-public (request-emergency-fund (subsidy-id uint) (amount-requested uint) (reason (string-ascii 100)))
+  (let
+    (
+      (subsidy (unwrap! (map-get? subsidies { subsidy-id: subsidy-id }) err-not-found))
+      (farmer (unwrap! (map-get? farmers { farmer-id: (get farmer-id subsidy) }) err-not-found))
+      (max-emergency-amount (/ (* (get total-amount subsidy) max-emergency-percentage) u100))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender (get wallet farmer)) err-unauthorized)
+    (asserts! (is-eq (get status subsidy) "active") err-invalid-status)
+    (asserts! (is-none (map-get? emergency-requests { subsidy-id: subsidy-id })) err-emergency-already-claimed)
+    (asserts! (<= amount-requested max-emergency-amount) err-emergency-limit-exceeded)
+    (asserts! (> amount-requested u0) err-invalid-amount)
+    
+    (map-set emergency-requests
+      { subsidy-id: subsidy-id }
+      {
+        farmer-id: (get farmer-id subsidy),
+        amount-requested: amount-requested,
+        reason: reason,
+        request-block: current-block,
+        oracle-verified: false,
+        disbursed: false,
+        verification-block: u0
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (verify-emergency-claim (subsidy-id uint))
+  (let
+    (
+      (emergency-request (unwrap! (map-get? emergency-requests { subsidy-id: subsidy-id }) err-not-found))
+      (oracle-auth (default-to { authorized: false } (map-get? authorized-oracles { oracle: tx-sender })))
+      (current-block stacks-block-height)
+    )
+    (asserts! (get authorized oracle-auth) err-oracle-not-authorized)
+    (asserts! (not (get oracle-verified emergency-request)) err-invalid-status)
+    
+    (map-set emergency-requests
+      { subsidy-id: subsidy-id }
+      (merge emergency-request {
+        oracle-verified: true,
+        verification-block: current-block
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (disburse-emergency-fund (subsidy-id uint))
+  (let
+    (
+      (emergency-request (unwrap! (map-get? emergency-requests { subsidy-id: subsidy-id }) err-not-found))
+      (subsidy (unwrap! (map-get? subsidies { subsidy-id: subsidy-id }) err-not-found))
+      (farmer (unwrap! (map-get? farmers { farmer-id: (get farmer-id subsidy) }) err-not-found))
+      (amount (get amount-requested emergency-request))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (get oracle-verified emergency-request) err-oracle-not-authorized)
+    (asserts! (not (get disbursed emergency-request)) err-emergency-already-claimed)
+    (asserts! (>= (- current-block (get verification-block emergency-request)) emergency-cooldown-blocks) err-emergency-cooldown)
+    (asserts! (>= (stx-get-balance (as-contract tx-sender)) amount) err-insufficient-funds)
+    
+    (try! (as-contract (stx-transfer? amount tx-sender (get wallet farmer))))
+    
+    (map-set emergency-requests
+      { subsidy-id: subsidy-id }
+      (merge emergency-request { disbursed: true })
+    )
+    
+    (var-set emergency-fund-total (+ (var-get emergency-fund-total) amount))
+    (ok amount)
+  )
+)
+
+(define-read-only (get-emergency-request (subsidy-id uint))
+  (map-get? emergency-requests { subsidy-id: subsidy-id })
+)
+
+(define-read-only (get-emergency-fund-total)
+  (var-get emergency-fund-total)
 )
