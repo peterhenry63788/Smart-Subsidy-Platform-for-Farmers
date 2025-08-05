@@ -441,3 +441,132 @@
 (define-read-only (get-emergency-fund-total)
   (var-get emergency-fund-total)
 )
+
+(define-map farmer-scores
+  { farmer-id: uint }
+  {
+    total-score: uint,
+    completed-subsidies: uint,
+    average-yield-ratio: uint,
+    reliability-score: uint,
+    last-updated: uint
+  }
+)
+
+
+(define-public (calculate-farmer-score (farmer-id uint))
+  (let
+    (
+      (farmer (unwrap! (map-get? farmers { farmer-id: farmer-id }) err-not-found))
+      (current-score (default-to 
+        { total-score: u500, completed-subsidies: u0, average-yield-ratio: u100, reliability-score: u500, last-updated: u0 }
+        (map-get? farmer-scores { farmer-id: farmer-id })))
+    )
+    (asserts! (get verified farmer) err-unauthorized)
+    
+    (let
+      (
+        (subsidies-count (get-farmer-subsidies-count farmer-id))
+        (avg-yield (get-farmer-average-yield-ratio farmer-id))
+        (reliability (get-farmer-reliability-score farmer-id))
+        (new-total-score (/ (+ (* avg-yield u4) (* reliability u6)) u10))
+      )
+      (map-set farmer-scores
+        { farmer-id: farmer-id }
+        {
+          total-score: new-total-score,
+          completed-subsidies: subsidies-count,
+          average-yield-ratio: avg-yield,
+          reliability-score: reliability,
+          last-updated: stacks-block-height
+        }
+      )
+      (ok new-total-score)
+    )
+  )
+)
+
+(define-private (get-farmer-subsidies-count (farmer-id uint))
+  (get count (fold check-subsidy-completion 
+    (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) 
+    { farmer-id: farmer-id, count: u0 }))
+)
+
+(define-private (check-subsidy-completion (subsidy-id uint) (acc { farmer-id: uint, count: uint }))
+  (match (map-get? subsidies { subsidy-id: subsidy-id })
+    subsidy (if (and (is-eq (get farmer-id subsidy) (get farmer-id acc))
+                     (is-eq (get status subsidy) "completed"))
+                { farmer-id: (get farmer-id acc), count: (+ (get count acc) u1) }
+                acc)
+    acc
+  )
+)
+
+(define-private (get-farmer-average-yield-ratio (farmer-id uint))
+  (let
+    (
+      (yield-data (fold calculate-yield-ratio 
+                    (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)
+                    { farmer-id: farmer-id, total-ratio: u0, count: u0 }))
+    )
+    (if (> (get count yield-data) u0)
+        (/ (get total-ratio yield-data) (get count yield-data))
+        u100)
+  )
+)
+
+(define-private (calculate-yield-ratio (subsidy-id uint) (acc { farmer-id: uint, total-ratio: uint, count: uint }))
+  (match (map-get? subsidies { subsidy-id: subsidy-id })
+    subsidy (if (and (is-eq (get farmer-id subsidy) (get farmer-id acc))
+                     (> (get actual-yield subsidy) u0))
+                (let ((ratio (/ (* (get actual-yield subsidy) u100) (get expected-yield subsidy))))
+                  { 
+                    farmer-id: (get farmer-id acc), 
+                    total-ratio: (+ (get total-ratio acc) ratio), 
+                    count: (+ (get count acc) u1) 
+                  })
+                acc)
+    acc
+  )
+)
+
+(define-private (get-farmer-reliability-score (farmer-id uint))
+  (let
+    (
+      (milestone-data (fold check-milestone-completion 
+                       (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)
+                       { farmer-id: farmer-id, completed: u0, total: u0 }))
+    )
+    (if (> (get total milestone-data) u0)
+        (/ (* (get completed milestone-data) u1000) (get total milestone-data))
+        u500)
+  )
+)
+
+(define-private (check-milestone-completion (subsidy-id uint) (acc { farmer-id: uint, completed: uint, total: uint }))
+  (match (map-get? subsidies { subsidy-id: subsidy-id })
+    subsidy (if (is-eq (get farmer-id subsidy) (get farmer-id acc))
+                { 
+                  farmer-id: (get farmer-id acc),
+                  completed: (+ (get completed acc) (get milestones-completed subsidy)),
+                  total: (+ (get total acc) u4)
+                }
+                acc)
+    acc
+  )
+)
+
+(define-read-only (get-farmer-score (farmer-id uint))
+  (map-get? farmer-scores { farmer-id: farmer-id })
+)
+
+(define-read-only (get-farmer-rating (farmer-id uint))
+  (match (map-get? farmer-scores { farmer-id: farmer-id })
+    score (let ((total (get total-score score)))
+            (if (>= total u800) "excellent"
+            (if (>= total u600) "good"
+            (if (>= total u400) "average"
+            "needs-improvement"))))
+    "unrated"
+  )
+)
