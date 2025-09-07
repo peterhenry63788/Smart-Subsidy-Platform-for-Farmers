@@ -14,6 +14,14 @@
 (define-constant emergency-cooldown-blocks u1008)
 (define-constant max-emergency-percentage u30)
 
+(define-constant max-coverage-percentage u80)
+(define-constant base-premium-rate u5)
+(define-constant weather-claim-window u144)
+
+(define-data-var next-policy-id uint u1)
+(define-data-var total-premiums-collected uint u0)
+(define-data-var total-claims-paid uint u0)
+
 (define-data-var emergency-fund-total uint u0)
 
 (define-data-var next-farmer-id uint u1)
@@ -569,4 +577,126 @@
             "needs-improvement"))))
     "unrated"
   )
+)
+
+
+(define-map insurance-policies
+  { policy-id: uint }
+  {
+    farmer-id: uint,
+    crop-type: (string-ascii 30),
+    coverage-amount: uint,
+    premium-paid: uint,
+    coverage-start-block: uint,
+    coverage-end-block: uint,
+    active: bool
+  }
+)
+
+(define-map weather-events
+  { event-id: uint }
+  {
+    event-type: (string-ascii 20),
+    severity: uint,
+    location: (string-ascii 100),
+    reported-block: uint,
+    oracle-verified: bool
+  }
+)
+
+(define-map insurance-claims
+  { policy-id: uint }
+  {
+    claim-amount: uint,
+    weather-event-id: uint,
+    claim-block: uint,
+    processed: bool,
+    payout-amount: uint
+  }
+)
+
+(define-public (purchase-insurance (farmer-id uint) (crop-type (string-ascii 30)) (coverage-amount uint) (coverage-blocks uint))
+  (let
+    (
+      (farmer (unwrap! (map-get? farmers { farmer-id: farmer-id }) err-not-found))
+      (policy-id (var-get next-policy-id))
+      (premium (calculate-premium coverage-amount coverage-blocks))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender (get wallet farmer)) err-unauthorized)
+    (asserts! (get verified farmer) err-unauthorized)
+    (asserts! (> coverage-amount u0) err-invalid-amount)
+    (asserts! (>= (stx-get-balance tx-sender) premium) err-insufficient-funds)
+
+    (try! (stx-transfer? premium tx-sender (as-contract tx-sender)))
+
+    (map-set insurance-policies
+      { policy-id: policy-id }
+      {
+        farmer-id: farmer-id,
+        crop-type: crop-type,
+        coverage-amount: coverage-amount,
+        premium-paid: premium,
+        coverage-start-block: current-block,
+        coverage-end-block: (+ current-block coverage-blocks),
+        active: true
+      }
+    )
+
+    (var-set next-policy-id (+ policy-id u1))
+    (var-set total-premiums-collected (+ (var-get total-premiums-collected) premium))
+    (ok policy-id)
+  )
+)
+
+(define-private (calculate-premium (coverage-amount uint) (coverage-blocks uint))
+  (/ (* (* coverage-amount base-premium-rate) coverage-blocks) u10000)
+)
+
+(define-public (file-insurance-claim (policy-id uint) (weather-event-id uint))
+  (let
+    (
+      (policy (unwrap! (map-get? insurance-policies { policy-id: policy-id }) err-not-found))
+      (farmer (unwrap! (map-get? farmers { farmer-id: (get farmer-id policy) }) err-not-found))
+      (weather-event (unwrap! (map-get? weather-events { event-id: weather-event-id }) err-not-found))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender (get wallet farmer)) err-unauthorized)
+    (asserts! (get active policy) err-invalid-status)
+    (asserts! (get oracle-verified weather-event) err-oracle-not-authorized)
+    (asserts! (>= current-block (get coverage-start-block policy)) err-invalid-status)
+    (asserts! (<= current-block (get coverage-end-block policy)) err-invalid-status)
+    (asserts! (<= (- current-block (get reported-block weather-event)) weather-claim-window) err-invalid-status)
+    (asserts! (is-none (map-get? insurance-claims { policy-id: policy-id })) err-already-exists)
+
+    (let ((claim-amount (calculate-claim-amount (get coverage-amount policy) (get severity weather-event))))
+      (map-set insurance-claims
+        { policy-id: policy-id }
+        {
+          claim-amount: claim-amount,
+          weather-event-id: weather-event-id,
+          claim-block: current-block,
+          processed: false,
+          payout-amount: u0
+        }
+      )
+      (ok claim-amount)
+    )
+  )
+)
+
+(define-private (calculate-claim-amount (coverage-amount uint) (severity uint))
+  (/ (* coverage-amount (if (<= severity u100) severity u100)) u100)
+)
+
+(define-read-only (get-insurance-policy (policy-id uint))
+  (map-get? insurance-policies { policy-id: policy-id })
+)
+
+(define-read-only (get-insurance-stats)
+  {
+    total-premiums: (var-get total-premiums-collected),
+    total-claims: (var-get total-claims-paid),
+    active-policies: (var-get next-policy-id)
+  }
 )
