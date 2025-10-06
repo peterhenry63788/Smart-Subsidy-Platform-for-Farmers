@@ -700,3 +700,117 @@
     active-policies: (var-get next-policy-id)
   }
 )
+
+
+(define-data-var next-resource-id uint u1)
+(define-data-var next-request-id uint u1)
+
+(define-map shared-resources
+  { resource-id: uint }
+  {
+    owner-farmer-id: uint,
+    resource-type: (string-ascii 30),
+    description: (string-ascii 100),
+    rental-cost: uint,
+    available: bool,
+    total-loans: uint
+  }
+)
+
+(define-map resource-requests
+  { request-id: uint }
+  {
+    requester-farmer-id: uint,
+    resource-id: uint,
+    request-block: uint,
+    return-block: uint,
+    status: (string-ascii 20),
+    deposit-paid: uint
+  }
+)
+
+(define-map lending-history
+  { farmer-id: uint }
+  { successful-loans: uint, failed-returns: uint, trust-score: uint }
+)
+
+(define-public (list-resource (resource-type (string-ascii 30)) (description (string-ascii 100)) (rental-cost uint))
+  (let
+    (
+      (farmer-data (unwrap! (map-get? farmer-wallet-to-id { wallet: tx-sender }) err-unauthorized))
+      (farmer-id (get farmer-id farmer-data))
+      (farmer (unwrap! (map-get? farmers { farmer-id: farmer-id }) err-not-found))
+      (resource-id (var-get next-resource-id))
+    )
+    (asserts! (get verified farmer) err-unauthorized)
+    (asserts! (> rental-cost u0) err-invalid-amount)
+    
+    (map-set shared-resources
+      { resource-id: resource-id }
+      { owner-farmer-id: farmer-id, resource-type: resource-type, description: description,
+        rental-cost: rental-cost, available: true, total-loans: u0 }
+    )
+    (var-set next-resource-id (+ resource-id u1))
+    (ok resource-id)
+  )
+)
+
+(define-public (request-resource (resource-id uint) (duration-blocks uint))
+  (let
+    (
+      (resource (unwrap! (map-get? shared-resources { resource-id: resource-id }) err-not-found))
+      (farmer-data (unwrap! (map-get? farmer-wallet-to-id { wallet: tx-sender }) err-unauthorized))
+      (requester-id (get farmer-id farmer-data))
+      (deposit (get rental-cost resource))
+      (request-id (var-get next-request-id))
+      (current-block stacks-block-height)
+    )
+    (asserts! (get available resource) err-invalid-status)
+    (asserts! (not (is-eq requester-id (get owner-farmer-id resource))) err-unauthorized)
+    (try! (stx-transfer? deposit tx-sender (as-contract tx-sender)))
+    
+    (map-set resource-requests
+      { request-id: request-id }
+      { requester-farmer-id: requester-id, resource-id: resource-id, request-block: current-block,
+        return-block: (+ current-block duration-blocks), status: "active", deposit-paid: deposit }
+    )
+    (map-set shared-resources { resource-id: resource-id } (merge resource { available: false }))
+    (var-set next-request-id (+ request-id u1))
+    (ok request-id)
+  )
+)
+
+(define-private (min-uint (a uint) (b uint))
+  (if (<= a b) a b))
+
+(define-public (return-resource (request-id uint))
+  (let
+    (
+      (request (unwrap! (map-get? resource-requests { request-id: request-id }) err-not-found))
+      (resource (unwrap! (map-get? shared-resources { resource-id: (get resource-id request) }) err-not-found))
+      (owner (unwrap! (map-get? farmers { farmer-id: (get owner-farmer-id resource) }) err-not-found))
+      (requester-history (default-to { successful-loans: u0, failed-returns: u0, trust-score: u1000 }
+                          (map-get? lending-history { farmer-id: (get requester-farmer-id request) })))
+    )
+    (asserts! (is-eq (get status request) "active") err-invalid-status)
+    
+    (try! (as-contract (stx-transfer? (get deposit-paid request) tx-sender (get wallet owner))))
+    (map-set resource-requests { request-id: request-id } (merge request { status: "completed" }))
+    (map-set shared-resources { resource-id: (get resource-id request) }
+      (merge resource { available: true, total-loans: (+ (get total-loans resource) u1) }))
+    (map-set lending-history { farmer-id: (get requester-farmer-id request) }
+      { successful-loans: (+ (get successful-loans requester-history) u1),
+        failed-returns: (get failed-returns requester-history),
+        trust-score: (min-uint u1000 (+ (get trust-score requester-history) u10)) })
+    (ok true)
+  )
+)
+
+(define-read-only (get-resource (resource-id uint))
+  (map-get? shared-resources { resource-id: resource-id })
+)
+
+(define-read-only (get-farmer-trust-score (farmer-id uint))
+  (default-to { successful-loans: u0, failed-returns: u0, trust-score: u1000 }
+    (map-get? lending-history { farmer-id: farmer-id }))
+)
