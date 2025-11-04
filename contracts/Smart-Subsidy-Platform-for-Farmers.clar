@@ -18,6 +18,14 @@
 (define-constant base-premium-rate u5)
 (define-constant weather-claim-window u144)
 
+(define-constant err-pool-not-found (err u112))
+(define-constant err-not-pool-member (err u113))
+(define-constant err-insufficient-pool-balance (err u114))
+(define-constant err-loan-limit-exceeded (err u115))
+(define-constant max-loan-percentage u50)
+
+(define-data-var next-pool-id uint u1)
+
 (define-data-var next-policy-id uint u1)
 (define-data-var total-premiums-collected uint u0)
 (define-data-var total-claims-paid uint u0)
@@ -813,4 +821,121 @@
 (define-read-only (get-farmer-trust-score (farmer-id uint))
   (default-to { successful-loans: u0, failed-returns: u0, trust-score: u1000 }
     (map-get? lending-history { farmer-id: farmer-id }))
+)
+
+
+(define-map savings-pools
+  { pool-id: uint }
+  {
+    name: (string-ascii 50),
+    founder-farmer-id: uint,
+    total-balance: uint,
+    member-count: uint,
+    created-block: uint,
+    active: bool
+  }
+)
+
+(define-map pool-members
+  { pool-id: uint, farmer-id: uint }
+  {
+    total-contributed: uint,
+    active-loan: uint,
+    loan-repaid: uint,
+    member-since: uint
+  }
+)
+
+(define-public (create-savings-pool (pool-name (string-ascii 50)) (initial-deposit uint))
+  (let
+    (
+      (farmer-data (unwrap! (map-get? farmer-wallet-to-id { wallet: tx-sender }) err-unauthorized))
+      (farmer-id (get farmer-id farmer-data))
+      (farmer (unwrap! (map-get? farmers { farmer-id: farmer-id }) err-not-found))
+      (pool-id (var-get next-pool-id))
+    )
+    (asserts! (get verified farmer) err-unauthorized)
+    (asserts! (>= initial-deposit u100) err-invalid-amount)
+    (try! (stx-transfer? initial-deposit tx-sender (as-contract tx-sender)))
+    
+    (map-set savings-pools { pool-id: pool-id }
+      { name: pool-name, founder-farmer-id: farmer-id, total-balance: initial-deposit,
+        member-count: u1, created-block: stacks-block-height, active: true })
+    (map-set pool-members { pool-id: pool-id, farmer-id: farmer-id }
+      { total-contributed: initial-deposit, active-loan: u0, loan-repaid: u0,
+        member-since: stacks-block-height })
+    (var-set next-pool-id (+ pool-id u1))
+    (ok pool-id)
+  )
+)
+
+(define-public (join-pool (pool-id uint) (deposit uint))
+  (let
+    (
+      (pool (unwrap! (map-get? savings-pools { pool-id: pool-id }) err-pool-not-found))
+      (farmer-data (unwrap! (map-get? farmer-wallet-to-id { wallet: tx-sender }) err-unauthorized))
+      (farmer-id (get farmer-id farmer-data))
+    )
+    (asserts! (get active pool) err-invalid-status)
+    (asserts! (is-none (map-get? pool-members { pool-id: pool-id, farmer-id: farmer-id })) err-already-exists)
+    (asserts! (>= deposit u100) err-invalid-amount)
+    (try! (stx-transfer? deposit tx-sender (as-contract tx-sender)))
+    
+    (map-set pool-members { pool-id: pool-id, farmer-id: farmer-id }
+      { total-contributed: deposit, active-loan: u0, loan-repaid: u0, member-since: stacks-block-height })
+    (map-set savings-pools { pool-id: pool-id }
+      (merge pool { total-balance: (+ (get total-balance pool) deposit),
+                    member-count: (+ (get member-count pool) u1) }))
+    (ok true)
+  )
+)
+
+(define-public (request-pool-loan (pool-id uint) (loan-amount uint))
+  (let
+    (
+      (pool (unwrap! (map-get? savings-pools { pool-id: pool-id }) err-pool-not-found))
+      (farmer-data (unwrap! (map-get? farmer-wallet-to-id { wallet: tx-sender }) err-unauthorized))
+      (farmer-id (get farmer-id farmer-data))
+      (member (unwrap! (map-get? pool-members { pool-id: pool-id, farmer-id: farmer-id }) err-not-pool-member))
+      (max-loan (/ (* (get total-balance pool) max-loan-percentage) u100))
+    )
+    (asserts! (is-eq (get active-loan member) u0) err-already-exists)
+    (asserts! (<= loan-amount max-loan) err-loan-limit-exceeded)
+    (asserts! (>= (get total-balance pool) loan-amount) err-insufficient-pool-balance)
+    (try! (as-contract (stx-transfer? loan-amount tx-sender (get wallet (unwrap! (map-get? farmers { farmer-id: farmer-id }) err-not-found)))))
+    
+    (map-set pool-members { pool-id: pool-id, farmer-id: farmer-id }
+      (merge member { active-loan: loan-amount }))
+    (map-set savings-pools { pool-id: pool-id }
+      (merge pool { total-balance: (- (get total-balance pool) loan-amount) }))
+    (ok loan-amount)
+  )
+)
+
+(define-public (repay-pool-loan (pool-id uint) (repay-amount uint))
+  (let
+    (
+      (pool (unwrap! (map-get? savings-pools { pool-id: pool-id }) err-pool-not-found))
+      (farmer-data (unwrap! (map-get? farmer-wallet-to-id { wallet: tx-sender }) err-unauthorized))
+      (farmer-id (get farmer-id farmer-data))
+      (member (unwrap! (map-get? pool-members { pool-id: pool-id, farmer-id: farmer-id }) err-not-pool-member))
+    )
+    (asserts! (> (get active-loan member) u0) err-invalid-status)
+    (try! (stx-transfer? repay-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set pool-members { pool-id: pool-id, farmer-id: farmer-id }
+      (merge member { active-loan: (- (get active-loan member) repay-amount),
+                      loan-repaid: (+ (get loan-repaid member) repay-amount) }))
+    (map-set savings-pools { pool-id: pool-id }
+      (merge pool { total-balance: (+ (get total-balance pool) repay-amount) }))
+    (ok true)
+  )
+)
+
+(define-read-only (get-savings-pool (pool-id uint))
+  (map-get? savings-pools { pool-id: pool-id })
+)
+
+(define-read-only (get-pool-membership (pool-id uint) (farmer-id uint))
+  (map-get? pool-members { pool-id: pool-id, farmer-id: farmer-id })
 )
